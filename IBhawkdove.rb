@@ -1,4 +1,3 @@
-
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
@@ -39,6 +38,7 @@ Config = Struct.new(
   :log_interval,       # Console logging interval (in generations)
   :csv_path,           # CSV output path (nil = disabled)
   :viz_dir,            # PNG output directory (nil = disabled)
+  :viz_snapshots,      # Number of gene_p snapshot histograms to render
   keyword_init: true
 ) do
   # Default configuration
@@ -54,7 +54,8 @@ Config = Struct.new(
       generations:      200,
       log_interval:     10,
       csv_path:         "results.csv",
-      viz_dir:          "."
+      viz_dir:          ".",
+      viz_snapshots:    6
     )
   end
 
@@ -275,13 +276,6 @@ class Visualizer
   N_BINS    = 20
   BIN_WIDTH = 1.0 / N_BINS
  
-  VIRIDIS_STOPS = [
-    [0.00, [68,   1,  84]],
-    [0.25, [59,  82, 139]],
-    [0.50, [33, 145, 140]],
-    [0.75, [94, 201,  98]],
-    [1.00, [253, 231,  37]],
-  ].freeze
  
   def initialize(config)
     @config         = config
@@ -304,7 +298,7 @@ class Visualizer
  
     render_k_history(dir)
     render_gene_p_final(dir)
-    render_gene_p_heatmap(dir)
+    render_gene_p_snapshots(dir)
  
     puts "  Plots saved to: #{File.expand_path(dir)}/"
   end
@@ -355,89 +349,67 @@ class Visualizer
     g.write(File.join(dir, "gene_p_final.png"))
   end
  
-  # Plot 3: gene_p heatmap over all generations (direct rendering with RMagick)
-  def render_gene_p_heatmap(dir)
-    n_gen = @gene_p_history.size
- 
-    # Density matrix: matrix[gi][bi] = number of individuals
-    matrix = @gene_p_history.map do |ps|
+  # Plot 3: gene_p snapshot histograms at evenly spaced generations (side by side)
+  def render_gene_p_snapshots(dir)
+    n_gen       = @gene_p_history.size
+    n_snap      = @config.viz_snapshots.clamp(1, n_gen)
+    snap_width  = 400
+    snap_height = 300
+
+    # Select evenly spaced generation indices (always include the last)
+    indices = if n_snap == 1
+                [n_gen - 1]
+              else
+                (0...n_snap).map { |i| ((i * (n_gen - 1).to_f) / (n_snap - 1)).round }
+              end.uniq
+
+    # Generate each snapshot as a gruff Bar chart saved to a temp file
+    panels = indices.map do |gi|
+      gen  = gi + 1
+      ps   = @gene_p_history[gi]
       bins = Array.new(N_BINS, 0)
       ps.each { |p| bins[bin_index(p)] += 1 }
-      bins
-    end
-    max_count = [matrix.flatten.max, 1].to_f
- 
-    ml, mr, mt, mb = 65, 30, 50, 55
-    cell_w = [[(900 - ml - mr) / n_gen, 1].max, 12].min
-    cell_h = 22
-    img_w  = ml + cell_w * n_gen + mr
-    img_h  = mt + cell_h * N_BINS + mb
- 
-    img = Magick::Image.new(img_w, img_h) { self.background_color = "#f8f8f8" }
- 
-    # Draw heatmap cells
-    cells = Magick::Draw.new
-    matrix.each_with_index do |bins, gi|
-      x0 = ml + gi * cell_w
-      bins.each_with_index do |count, bi|
-        y0 = mt + (N_BINS - 1 - bi) * cell_h
-        r, g, b = viridis(count / max_count)
-        cells.fill(format("#%02x%02x%02x", r, g, b))
-        cells.stroke("none")
-        cells.rectangle(x0, y0, x0 + cell_w - 1, y0 + cell_h - 1)
+
+      labels = N_BINS.times.each_with_object({}) do |i, h|
+        h[i] = format("%.1f", i * BIN_WIDTH) if i % 5 == 0
       end
+
+      g = Gruff::Bar.new(snap_width)
+      g.title           = "Gen #{gen}"
+      g.title_font_size = 16
+      g.labels          = labels
+      g.minimum_value   = 0
+      g.maximum_value   = @config.n
+      g.hide_legend     = true
+      g.margins         = 10
+
+      tmp = File.join(dir, ".snap_#{gi}.png")
+      g.write(tmp)
+      tmp
     end
-    cells.draw(img)
- 
-    # Draw heatmap border
-    bd = Magick::Draw.new
-    bd.stroke("black").stroke_width(1).fill("none")
-    bd.rectangle(ml, mt, ml + cell_w * n_gen, mt + cell_h * N_BINS)
-    bd.draw(img)
- 
-    # Text labels (NorthWestGravity = absolute positioning)
+
+    # Stitch panels horizontally with RMagick
+    images   = panels.map { |f| Magick::Image.read(f).first }
+    total_w  = snap_width * images.size
+    combined = Magick::Image.new(total_w, snap_height) { self.background_color = "white" }
+    images.each_with_index do |img, i|
+      combined.composite!(img, i * snap_width, 0, Magick::OverCompositeOp)
+    end
+
+    # Add overall title with 30px top margin
+    combined = combined.extent(total_w, snap_height + 30, 0, -30)
     tx = Magick::Draw.new
-    tx.gravity(Magick::NorthWestGravity)
+    tx.gravity(Magick::NorthGravity)
     tx.fill("black")
-    tx.font_size(11)
- 
-    # Y-axis labels: gene_p values
-    (0..N_BINS).each do |bi|
-      next unless bi % 4 == 0
-      y = mt + (N_BINS - bi) * cell_h
-      tx.text(2, y + 4, format("%.2f", bi * BIN_WIDTH))
-    end
-    tx.text(2, mt - 16, "gene_p\u2191")
- 
-    # X-axis labels: generation indices
-    x_step = [n_gen / 8, 1].max
-    (0...n_gen).each do |gi|
-      next unless gi == 0 || (gi + 1) % x_step == 0 || gi == n_gen - 1
-      tx.text(ml + gi * cell_w, mt + cell_h * N_BINS + 18, (gi + 1).to_s)
-    end
-    tx.text(ml + (cell_w * n_gen) / 2 - 35, img_h - 13, "Generation\u2192")
- 
-    # Title
-    tx.font_size(15)
-    tx.text(ml, 20,
-            "gene_p Distribution over Generations" \
-            "  (ESS = #{format('%.3f', @config.ess)})")
- 
-    tx.draw(img)
-    img.write(File.join(dir, "gene_p_heatmap.png"))
+    tx.font_size(14)
+    tx.text(0, 6, "gene_p Snapshots  (ESS = #{format('%.3f', @config.ess)})")
+    tx.draw(combined)
+
+    combined.write(File.join(dir, "gene_p_snapshots.png"))
+    panels.each { |f| File.delete(f) rescue nil }
   end
- 
-  # Viridis-like colormap: t ∈ [0.0, 1.0] → [r, g, b]
-  def viridis(t)
-    t  = t.clamp(0.0, 1.0)
-    lo = VIRIDIS_STOPS.rindex { |(ta, _)| ta <= t } || 0
-    hi = [lo + 1, VIRIDIS_STOPS.size - 1].min
-    ta, ca = VIRIDIS_STOPS[lo]
-    tb, cb = VIRIDIS_STOPS[hi]
-    ratio  = tb > ta ? (t - ta) / (tb - ta) : 0.0
-    ca.zip(cb).map { |a, b| (a + (b - a) * ratio).round.clamp(0, 255) }
+
   end
-end
 
 
 class Simulator
@@ -484,6 +456,7 @@ def parse_args(argv, config)
     when '--csv'          then config.csv_path         = argv[i + 1];         i += 2
     when '--no-viz'       then config.viz_dir          = nil;                 i += 1
     when '--viz-dir'      then config.viz_dir          = argv[i + 1];         i += 2
+    when '--viz-snapshots' then config.viz_snapshots     = argv[i + 1].to_i;   i += 2
     else                  i += 1
     end
   end
