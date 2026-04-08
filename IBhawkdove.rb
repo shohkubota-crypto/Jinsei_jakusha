@@ -382,6 +382,7 @@ class Visualizer
       g.maximum_value   = @config.n
       g.hide_legend     = true
       g.margins         = 10
+      g.data("gen #{gen}", bins)
 
       tmp = File.join(dir, ".snap_#{gi}.png")
       g.write(tmp)
@@ -391,7 +392,8 @@ class Visualizer
     # Stitch panels horizontally with RMagick
     images   = panels.map { |f| Magick::Image.read(f).first }
     total_w  = snap_width * images.size
-    combined = Magick::Image.new(total_w, snap_height) { self.background_color = "white" }
+    combined = Magick::Image.new(total_w, snap_height)
+    combined.background_color = "white"
     images.each_with_index do |img, i|
       combined.composite!(img, i * snap_width, 0, Magick::OverCompositeOp)
     end
@@ -401,6 +403,7 @@ class Visualizer
     tx = Magick::Draw.new
     tx.gravity(Magick::NorthGravity)
     tx.fill("black")
+    tx.font("/System/Library/Fonts/Helvetica.ttc")
     tx.font_size(14)
     tx.text(0, 6, "gene_p Snapshots  (ESS = #{format('%.3f', @config.ess)})")
     tx.draw(combined)
