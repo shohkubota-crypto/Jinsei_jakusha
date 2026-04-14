@@ -2,13 +2,15 @@
 # frozen_string_literal: true
 
 # =============================================================================
-# Individual-based Hawk–Dove game simulator
+# Individual-based Hawk–Dove game simulator  [fixed-init variant]
 # =============================================================================
 #
 # Usage:
-#   ruby hawk_dove_sim.rb                    
-#   ruby hawk_dove_sim.rb --generations 1000 
-#   ruby hawk_dove_sim.rb --no-csv           
+#   ruby hawk_dove_sim_init.rb                         # random init (default)
+#   ruby hawk_dove_sim_init.rb --init-p 0.667          # all individuals start at ESS
+#   ruby hawk_dove_sim_init.rb --init-p 0.0            # all Dove
+#   ruby hawk_dove_sim_init.rb --init-p 1.0            # all Hawk
+#   ruby hawk_dove_sim_init.rb --init-p 0.5 --generations 1000
 # =============================================================================
 
 require 'csv'
@@ -39,23 +41,25 @@ Config = Struct.new(
   :csv_path,           # CSV output path (nil = disabled)
   :viz_dir,            # PNG output directory (nil = disabled)
   :viz_snapshots,      # Number of gene_p snapshot histograms to render
+  :init_p,             # Initial gene_p for all individuals (nil = uniform random)
   keyword_init: true
 ) do
   # Default configuration
   def self.default
     new(
-      n:                100,
+      n:                1000,
       v:                0.4,
       c:                0.6,
       mu:               0.01,
       mut_sigma:        0.05,
-      max_battles:      500,
-      k_threshold:      40,
-      generations:      200,
+      max_battles:      5000,
+      k_threshold:      400,
+      generations:      1000,
       log_interval:     10,
       csv_path:         "results.csv",
       viz_dir:          ".",
-      viz_snapshots:    6
+      viz_snapshots:    6,
+      init_p:           nil
     )
   end
 
@@ -83,10 +87,9 @@ class Organism
     @fitness.floor
   end
 
-  # Reproduce offspring: generate floor(fitness) offspring, with mutation occurring with probability mu
-  # Assumes fitness >= 1.0 before calling this method
-  def reproduce(mu, mut_sigma)
-    Array.new(fitness_floor) do
+  # Reproduce exactly n offspring (n <= fitness_floor), with mutation probability mu
+  def reproduce_n(n, mu, mut_sigma)
+    Array.new(n) do
       new_p = if rand < mu
                 MathUtil.rand_gaussian(@gene_p, mut_sigma).clamp(0.0, 1.0)
               else
@@ -108,12 +111,6 @@ module HawkDoveGame
     org_b.fitness += pb
   end
 
-  # k = sum of floor(fitness) for all individuals with fitness >= 1
-  # k determines the number of individuals replaced in the next generation (= selection pool size)
-  def self.compute_k(individuals)
-    individuals.sum { |ind| ind.fitness >= 1.0 ? ind.fitness_floor : 0 }
-  end
-
   private_class_method def self.payoffs(sa, sb, v, c)
     case [sa, sb]
     in [:hawk, :hawk] then [(v - c) / 2.0, (v - c) / 2.0]
@@ -130,8 +127,8 @@ class Population
 
   def initialize(config)
     @config = config
-    # Initial population: gene_p is initialized from a uniform random distribution over [0, 1]
-    @individuals   = Array.new(config.n) { Organism.new(rand) }
+    # Initial population: uniform random if init_p is nil, otherwise all start at init_p
+    @individuals   = Array.new(config.n) { Organism.new(config.init_p || rand) }
     @last_k        = 0
     @last_early_stop = false
   end
@@ -200,21 +197,30 @@ class Population
     org.fitness >= 1.0 ? org.fitness_floor : 0
   end
 
-  # Selection and reproduction phase: remove the lowest k individuals and let survivors reproduce
-  # Returns k (number of individuals replaced in this generation)
+  # Selection and reproduction phase
+  # 1. Sort all individuals by fitness (descending)
+  # 2. Normalize fitness for all: clamp negatives to 0, then add 1
+  # 3. Let individuals reproduce in rank order until exactly N offspring are produced
+  # Returns k (number of individuals that produced no offspring = replaced individuals)
   def evolve
-    cfg     = @config
-    sorted  = @individuals.sort_by(&:fitness).reverse
-    k       = HawkDoveGame.compute_k(sorted)
+    cfg    = @config
+    sorted = @individuals.sort_by(&:fitness).reverse
 
-    survivors = sorted.first(cfg.n - k)
+    # Normalize: clamp negative fitness to 0, then add 1 for all
+    sorted.each { |ind| ind.fitness = [ind.fitness, 0.0].max + 1.0 }
 
-    # Clamp negative fitness → add 1 to all → generate floor(fitness) offspring
-    # Σfloor(fi + 1) = Σfloor(fi) + (N-k) = k + (N-k) = N
-    survivors.each { |ind| ind.fitness = [ind.fitness, 0.0].max + 1.0 }
-    @individuals = survivors.flat_map { |ind| ind.reproduce(cfg.mu, cfg.mut_sigma) }
+    # Reproduce in rank order, stopping exactly at N offspring
+    next_gen     = []
+    reproducers  = 0
+    sorted.each do |ind|
+      break if next_gen.size >= cfg.n
+      quota = [ind.fitness_floor, cfg.n - next_gen.size].min
+      next_gen.concat(ind.reproduce_n(quota, cfg.mu, cfg.mut_sigma))
+      reproducers += 1 if quota > 0
+    end
 
-    k
+    @individuals = next_gen
+    cfg.n - reproducers  # k = individuals that produced no offspring
   end
 end
 
@@ -233,8 +239,10 @@ class Reporter
     puts "=" * 65
     puts "  N=#{cfg.n}  |  V=#{cfg.v}  C=#{cfg.c}  " \
          "|  mu=#{cfg.mu}  mut_sigma=#{cfg.mut_sigma}"
+    init_label = cfg.init_p ? format("%.4f", cfg.init_p) : "random"
     puts "  max_battles=#{cfg.max_battles}  " \
          "k_threshold=#{cfg.k_threshold}  (incremental monitor)"
+    puts "  init_p=#{init_label}"
     puts "  ESS (theoretical p*) = #{format('%.4f', cfg.ess)}"
     puts "=" * 65
     puts format("  %-6s  %-8s  %-8s  %-6s  %-5s  %s",
@@ -460,6 +468,7 @@ def parse_args(argv, config)
     when '--no-viz'       then config.viz_dir          = nil;                 i += 1
     when '--viz-dir'      then config.viz_dir          = argv[i + 1];         i += 2
     when '--viz-snapshots' then config.viz_snapshots     = argv[i + 1].to_i;   i += 2
+    when '--init-p'        then config.init_p            = argv[i + 1].to_f;   i += 2
     else                  i += 1
     end
   end
